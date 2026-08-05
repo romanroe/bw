@@ -1,0 +1,552 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  bw [options] -- command [args...]
+  bw [options] command [args...]
+
+Options:
+  --workdir DIR      Directory that should be mounted read-write. Default: current directory.
+  --mask PATH        Hide this host path inside the sandbox. Can be used multiple times.
+  --offline          Disable network access.
+  --allow-env-file   Expose .env / .env.* files in the workdir. Default: hidden.
+  --help             Show this help.
+
+Examples:
+  bw opencode
+  bw --offline bash
+  bw --mask "$HOME/Nextcloud/Privat" -- opencode
+  bw --allow-env-file -- opencode
+USAGE
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Missing required command: $1" >&2
+    exit 127
+  }
+}
+
+canon_path() {
+  local p="$1"
+
+  # Expand a literal leading ~ because it is not expanded when passed quoted.
+  if [[ "$p" == "~" ]]; then
+    p="$REAL_HOME"
+  elif [[ "$p" == ~/* ]]; then
+    p="$REAL_HOME/${p#~/}"
+  fi
+
+  readlink -m -- "$p"
+}
+
+is_subpath_or_same() {
+  local child="$1"
+  local parent="$2"
+
+  [[ "$child" == "$parent" || "$child" == "$parent"/* ]]
+}
+
+require_cmd bwrap
+require_cmd readlink
+require_cmd mktemp
+require_cmd mkdir
+
+REAL_HOME="${HOME:?HOME is not set}"
+REAL_USER="${USER:-$(id -un)}"
+REAL_XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}"
+REAL_WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}"
+WORKDIR="$(pwd -P)"
+SANDBOX_HOME="$REAL_HOME/sandbox_home"
+NETWORK=1
+ALLOW_ENV_FILE=0
+
+# These directories provide the runtime dependencies for host executables
+# without exposing user data outside the explicit allowlist below.
+SYSTEM_RO_PATHS=(
+  /usr
+  /usr/local
+  /bin
+  /sbin
+  /lib
+  /lib64
+  /etc
+)
+
+# Optional masks are only needed to hide a subpath of an otherwise allowed
+# mount. All host data paths are hidden by default.
+MASKED_PATHS=()
+
+# Host paths under HOME that are required at runtime but must remain read-only.
+READONLY_HOME_PATHS=(
+  "$REAL_HOME/.pyenv"
+  "$REAL_HOME/.local/bin"
+  "$REAL_HOME/.local/share/mise"
+  "$REAL_HOME/.local/share/pipx"
+  "$REAL_HOME/.config/mise"
+)
+
+# Host files under HOME required at runtime but kept read-only. Do not add
+# Poetry's auth.toml here: private package credentials stay outside bw.
+READONLY_HOME_FILES=(
+  "$REAL_HOME/.config/pypoetry/config.toml"
+)
+
+# Host paths under HOME that should be writable inside the sandbox.
+# They must already exist; otherwise the script aborts.
+WRITABLE_HOME_PATHS=(
+  "$REAL_HOME/.claude"
+  "$REAL_HOME/.codex"
+  "$REAL_HOME/.junie"
+  "$REAL_HOME/.local/share/kwrite"
+  "$REAL_HOME/.local/share/claude"
+  "$REAL_HOME/.local/share/junie"
+  "$REAL_HOME/.local/state"
+  "$REAL_HOME/.config/opencode"
+  "$REAL_HOME/.cache/opencode"
+  "$REAL_HOME/.local/share/opencode"
+  "$REAL_HOME/.local/state/opencode"
+  "$REAL_HOME/.opencode"
+)
+
+# Host files under HOME that should be writable inside the sandbox.
+# They must already exist; otherwise the script aborts.
+WRITABLE_HOME_FILES=(
+  "$REAL_HOME/.claude.json"
+  "$REAL_HOME/.config/kwriterc"
+  "$REAL_HOME/.local/bin/junie"
+)
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --workdir)
+      [[ $# -ge 2 ]] || { echo "--workdir requires an argument" >&2; exit 2; }
+      WORKDIR="$(canon_path "$2")"
+      shift 2
+      ;;
+    --mask)
+      [[ $# -ge 2 ]] || { echo "--mask requires an argument" >&2; exit 2; }
+      MASKED_PATHS+=("$(canon_path "$2")")
+      shift 2
+      ;;
+    --offline)
+      NETWORK=0
+      shift
+      ;;
+    --allow-env-file)
+      ALLOW_ENV_FILE=1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+[[ $# -gt 0 ]] || { usage >&2; exit 2; }
+[[ -d "$WORKDIR" ]] || {
+  echo "Workdir does not exist or is not a directory: $WORKDIR" >&2
+  exit 2
+}
+
+WORKDIR="$(canon_path "$WORKDIR")"
+REAL_HOME="$(canon_path "$REAL_HOME")"
+SANDBOX_HOME="$(canon_path "$SANDBOX_HOME")"
+if [[ -n "$REAL_XDG_RUNTIME_DIR" ]]; then
+  REAL_XDG_RUNTIME_DIR="$(canon_path "$REAL_XDG_RUNTIME_DIR")"
+fi
+
+if [[ "$WORKDIR" == "$REAL_HOME" ]]; then
+  echo "Refusing to run: workdir must not be HOME." >&2
+  echo "  home: $REAL_HOME" >&2
+  exit 2
+fi
+
+if [[ ! -e "$SANDBOX_HOME" ]]; then
+  mkdir -m 0700 -- "$SANDBOX_HOME"
+elif [[ ! -d "$SANDBOX_HOME" ]]; then
+  echo "Sandbox home exists but is not a directory: $SANDBOX_HOME" >&2
+  exit 2
+fi
+
+if is_subpath_or_same "$WORKDIR" "$SANDBOX_HOME"; then
+  echo "Refusing to run: workdir must not be inside sandbox home." >&2
+  echo "  workdir:     $WORKDIR" >&2
+  echo "  sandbox home: $SANDBOX_HOME" >&2
+  exit 2
+fi
+
+WAYLAND_SOCKET=""
+if [[ -n "$REAL_WAYLAND_DISPLAY" && "$REAL_WAYLAND_DISPLAY" != */* ]] \
+  && [[ -n "$REAL_XDG_RUNTIME_DIR" ]] \
+  && [[ -S "$REAL_XDG_RUNTIME_DIR/$REAL_WAYLAND_DISPLAY" ]]; then
+  WAYLAND_SOCKET="$REAL_XDG_RUNTIME_DIR/$REAL_WAYLAND_DISPLAY"
+fi
+
+# On this system /etc/resolv.conf points into /run. The sandbox must see the
+# resolved target so DNS works without exposing the rest of /run.
+RESOLV_CONF=""
+if [[ -e /etc/resolv.conf ]]; then
+  candidate_resolv_conf="$(readlink -f /etc/resolv.conf)"
+  if [[ -f "$candidate_resolv_conf" ]]; then
+    RESOLV_CONF="$candidate_resolv_conf"
+  fi
+fi
+
+# A masked parent would also hide the writable workdir. That is almost always
+# a configuration mistake, so fail closed.
+for p in "${MASKED_PATHS[@]}"; do
+  p="$(canon_path "$p")"
+
+  if is_subpath_or_same "$WORKDIR" "$p"; then
+    echo "Refusing to run: workdir is inside masked path." >&2
+    echo "  workdir: $WORKDIR" >&2
+    echo "  masked:  $p" >&2
+    exit 2
+  fi
+
+  if is_subpath_or_same "$SANDBOX_HOME" "$p"; then
+    echo "Refusing to run: sandbox home is inside masked path." >&2
+    echo "  sandbox home: $SANDBOX_HOME" >&2
+    echo "  masked:       $p" >&2
+    exit 2
+  fi
+done
+
+for raw in "${READONLY_HOME_PATHS[@]}"; do
+  path="$(canon_path "$raw")"
+
+  if [[ ! -d "$path" ]]; then
+    echo "Read-only home path does not exist or is not a directory: $path" >&2
+    exit 2
+  fi
+
+  if ! is_subpath_or_same "$path" "$REAL_HOME"; then
+    echo "Read-only home path must be inside HOME." >&2
+    echo "  home: $REAL_HOME" >&2
+    echo "  path: $path" >&2
+    exit 2
+  fi
+
+  for masked_raw in "${MASKED_PATHS[@]}"; do
+    masked="$(canon_path "$masked_raw")"
+
+    if is_subpath_or_same "$path" "$masked"; then
+      echo "Read-only home path is inside masked path." >&2
+      echo "  read-only: $path" >&2
+      echo "  masked:    $masked" >&2
+      exit 2
+    fi
+  done
+done
+
+NODE_BIN="$(canon_path "$REAL_HOME/.local/share/mise/installs/node/latest/bin")"
+if [[ ! -x "$NODE_BIN/node" ]]; then
+  echo "Codex Node runtime is not executable: $NODE_BIN/node" >&2
+  exit 2
+fi
+
+SANDBOX_PATH="$NODE_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+IFS=: read -r -a HOST_PATH_ENTRIES <<< "$PATH"
+for raw_path in "${HOST_PATH_ENTRIES[@]}"; do
+  [[ -n "$raw_path" ]] || continue
+  path="$(canon_path "$raw_path")"
+  [[ -d "$path" ]] || continue
+
+  for raw in "${READONLY_HOME_PATHS[@]}"; do
+    readonly_path="$(canon_path "$raw")"
+    if is_subpath_or_same "$path" "$readonly_path"; then
+      SANDBOX_PATH="$path:$SANDBOX_PATH"
+      break
+    fi
+  done
+done
+
+for raw in "${READONLY_HOME_FILES[@]}"; do
+  path="$(canon_path "$raw")"
+
+  if [[ ! -f "$path" ]]; then
+    echo "Read-only home file does not exist or is not a regular file: $path" >&2
+    exit 2
+  fi
+
+  if ! is_subpath_or_same "$path" "$REAL_HOME"; then
+    echo "Read-only home file must be inside HOME." >&2
+    echo "  home: $REAL_HOME" >&2
+    echo "  path: $path" >&2
+    exit 2
+  fi
+
+  for masked_raw in "${MASKED_PATHS[@]}"; do
+    masked="$(canon_path "$masked_raw")"
+
+    if is_subpath_or_same "$path" "$masked"; then
+      echo "Read-only home file is inside masked path." >&2
+      echo "  read-only: $path" >&2
+      echo "  masked:    $masked" >&2
+      exit 2
+    fi
+  done
+done
+
+for raw in "${WRITABLE_HOME_PATHS[@]}"; do
+  path="$(canon_path "$raw")"
+
+  if [[ ! -d "$path" ]]; then
+    echo "Writable home path does not exist or is not a directory: $path" >&2
+    exit 2
+  fi
+
+  if ! is_subpath_or_same "$path" "$REAL_HOME"; then
+    echo "Writable home path must be inside HOME." >&2
+    echo "  home: $REAL_HOME" >&2
+    echo "  path: $path" >&2
+    exit 2
+  fi
+
+  for masked_raw in "${MASKED_PATHS[@]}"; do
+    masked="$(canon_path "$masked_raw")"
+
+    if is_subpath_or_same "$path" "$masked"; then
+      echo "Writable home path is inside masked path." >&2
+      echo "  writable: $path" >&2
+      echo "  masked:   $masked" >&2
+      exit 2
+    fi
+  done
+done
+
+for raw in "${WRITABLE_HOME_FILES[@]}"; do
+  path="$(canon_path "$raw")"
+
+  if [[ ! -f "$path" ]]; then
+    echo "Writable home file does not exist or is not a regular file: $path" >&2
+    exit 2
+  fi
+
+  if ! is_subpath_or_same "$path" "$REAL_HOME"; then
+    echo "Writable home file must be inside HOME." >&2
+    echo "  home: $REAL_HOME" >&2
+    echo "  path: $path" >&2
+    exit 2
+  fi
+
+  for masked_raw in "${MASKED_PATHS[@]}"; do
+    masked="$(canon_path "$masked_raw")"
+
+    if is_subpath_or_same "$path" "$masked"; then
+      echo "Writable home file is inside masked path." >&2
+      echo "  writable: $path" >&2
+      echo "  masked:   $masked" >&2
+      exit 2
+    fi
+  done
+done
+
+EMPTY_DENY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bwrap-deny.XXXXXX")"
+chmod 0555 "$EMPTY_DENY_DIR"
+EMPTY_DENY_FILE="$(mktemp "${TMPDIR:-/tmp}/bwrap-deny-file.XXXXXX")"
+chmod 0444 "$EMPTY_DENY_FILE"
+trap 'rm -rf "$EMPTY_DENY_DIR" "$EMPTY_DENY_FILE"' EXIT
+
+BWRAP_ARGS=(
+  --die-with-parent
+  --unshare-all
+  --hostname bwrap-sandbox
+
+  # Build a private filesystem. Host paths are exposed only through the
+  # explicit read-only system mounts and writable allowlist below.
+  --proc /proc
+  --dev /dev
+  --tmpfs /tmp
+  --tmpfs /var/tmp
+  --dir "$REAL_HOME"
+
+  # Persistent fallback for HOME writes. Specific HOME mounts below overlay it.
+  --bind "$SANDBOX_HOME" "$REAL_HOME"
+
+  # Keep the environment small and predictable.
+  --clearenv
+  --setenv HOME "$REAL_HOME"
+  --setenv USER "$REAL_USER"
+  --setenv LOGNAME "$REAL_USER"
+  --setenv PATH "$SANDBOX_PATH"
+  --setenv BROWSER /usr/bin/brave-browser
+  --setenv TERM "${TERM:-xterm-256color}"
+  --setenv LANG "${LANG:-C.UTF-8}"
+  --setenv XDG_CACHE_HOME "$REAL_HOME/.cache"
+  --setenv XDG_CONFIG_HOME "$REAL_HOME/.config"
+  --setenv PIP_CACHE_DIR "$REAL_HOME/.cache/pip"
+  --setenv NPM_CONFIG_CACHE "$REAL_HOME/.cache/npm"
+)
+
+for path in "${SYSTEM_RO_PATHS[@]}"; do
+  if [[ -e "$path" ]]; then
+    BWRAP_ARGS+=(--ro-bind "$path" "$path")
+  fi
+done
+
+if [[ -n "$RESOLV_CONF" ]]; then
+  BWRAP_ARGS+=(--ro-bind "$RESOLV_CONF" "$RESOLV_CONF")
+fi
+
+for raw in "${READONLY_HOME_PATHS[@]}"; do
+  path="$(canon_path "$raw")"
+  BWRAP_ARGS+=(--ro-bind "$path" "$path")
+done
+
+for raw in "${READONLY_HOME_FILES[@]}"; do
+  path="$(canon_path "$raw")"
+  BWRAP_ARGS+=(--ro-bind "$path" "$path")
+done
+
+# Use a private runtime directory. The Wayland socket is the only host runtime
+# socket deliberately exposed, which keeps Wayland clipboard support working.
+BWRAP_ARGS+=(--dir /tmp/runtime)
+BWRAP_ARGS+=(--chmod 0700 /tmp/runtime)
+BWRAP_ARGS+=(--setenv XDG_RUNTIME_DIR /tmp/runtime)
+if [[ -n "$WAYLAND_SOCKET" ]]; then
+  BWRAP_ARGS+=(--bind "$WAYLAND_SOCKET" "/tmp/runtime/$REAL_WAYLAND_DISPLAY")
+  BWRAP_ARGS+=(--setenv WAYLAND_DISPLAY "$REAL_WAYLAND_DISPLAY")
+fi
+
+if [[ -n "${LC_ALL:-}" ]]; then
+  BWRAP_ARGS+=(--setenv LC_ALL "$LC_ALL")
+fi
+
+# Keep terminal-specific hints that interactive TUIs use for layout, colors,
+# and integration behavior after --clearenv.
+for var in \
+  COLORTERM \
+  TERM_PROGRAM \
+  TERM_PROGRAM_VERSION \
+  KITTY_WINDOW_ID \
+  KITTY_PID \
+  WEZTERM_PANE \
+  WEZTERM_UNIX_SOCKET \
+  GHOSTTY_RESOURCES_DIR \
+  GHOSTTY_BIN_DIR \
+  VTE_VERSION \
+  KONSOLE_VERSION \
+  ALACRITTY_SOCKET \
+  TMUX \
+  STY \
+  COLUMNS \
+  LINES; do
+  if [[ -n "${!var:-}" ]]; then
+    BWRAP_ARGS+=(--setenv "$var" "${!var}")
+  fi
+done
+
+# Pass editor preference through for tools that open an external editor.
+if [[ -n "${EDITOR:-}" ]]; then
+  BWRAP_ARGS+=(--setenv EDITOR "$EDITOR")
+fi
+
+if [[ "$NETWORK" -eq 1 ]]; then
+  # --unshare-all disables networking; --share-net opts back into the host
+  # network namespace.
+  BWRAP_ARGS+=(--share-net)
+fi
+
+# Pass common LLM credentials through if present.
+# Add/remove entries as needed.
+for var in \
+  OPENAI_API_KEY \
+  ANTHROPIC_API_KEY \
+  GEMINI_API_KEY \
+  GOOGLE_API_KEY \
+  OPENROUTER_API_KEY \
+  OPENCODE_API_KEY; do
+  if [[ -n "${!var:-}" ]]; then
+    BWRAP_ARGS+=(--setenv "$var" "${!var}")
+  fi
+done
+
+# The selected workdir and selected HOME paths are the only additional host
+# data paths mounted read-write. Apply masks afterwards so they can hide a
+# subpath of an otherwise allowed mount.
+BWRAP_ARGS+=(--bind "$WORKDIR" "$WORKDIR")
+for raw in "${WRITABLE_HOME_PATHS[@]}"; do
+  path="$(canon_path "$raw")"
+  BWRAP_ARGS+=(--bind "$path" "$path")
+done
+
+for raw in "${WRITABLE_HOME_FILES[@]}"; do
+  path="$(canon_path "$raw")"
+  BWRAP_ARGS+=(--bind "$path" "$path")
+done
+
+# Mask paths within the exposed filesystem.
+#
+# Existing paths are replaced by an empty, read-only directory. Non-existing
+# paths are skipped because they cannot leak data.
+for raw in "${MASKED_PATHS[@]}"; do
+  path="$(canon_path "$raw")"
+
+  if [[ -e "$path" ]]; then
+    BWRAP_ARGS+=(--ro-bind "$EMPTY_DENY_DIR" "$path")
+  fi
+done
+
+# Hide project secret files by default. Each matching .env file in the workdir
+# is replaced by an empty, read-only file. --allow-env-file opts out and exposes
+# the real contents. Symlinks (-type f excludes them) and the well-known
+# non-secret templates are left untouched.
+if [[ "$ALLOW_ENV_FILE" -eq 0 ]]; then
+  while IFS= read -r -d '' env_file; do
+    case "${env_file##*/}" in
+      .env.example|.env.sample|.env.template|.env.dist) continue ;;
+    esac
+    BWRAP_ARGS+=(--ro-bind "$EMPTY_DENY_FILE" "$env_file")
+  done < <(find "$WORKDIR" -type f \( -name '.env' -o -name '.env.*' \) -print0)
+fi
+
+BWRAP_ARGS+=(--chdir "$WORKDIR")
+
+CMD="$1"
+
+if [[ "$CMD" != */* ]]; then
+  SHELL_CMD_TYPE=""
+  if [[ "$CMD" =~ ^[[:alnum:]_+-]+$ ]] \
+    && SHELL_CMD_TYPE="$(bash -ic 'type -t -- "$1" 2>/dev/null' bash "$CMD" 2>/dev/null || true)" \
+     && [[ "${SHELL_CMD_TYPE##*$'\n'}" == "alias" ]]; then
+    shift
+    set -- /bin/bash -ic "$CMD \"\$@\"" bash "$@"
+    bwrap "${BWRAP_ARGS[@]}" -- "$@"
+    exit $?
+  fi
+
+  HOST_CMD_PATH="$(command -v -- "$CMD" || true)"
+
+  if [[ -z "$HOST_CMD_PATH" ]]; then
+    echo "Command not found on host: $CMD" >&2
+    exit 127
+  fi
+
+  # Execute the final target of an absolute symlink. A bind-mounted symlink
+  # can otherwise point to a path that is intentionally absent in the sandbox.
+  if [[ "$HOST_CMD_PATH" == /* ]]; then
+    HOST_CMD_PATH="$(readlink -f -- "$HOST_CMD_PATH")"
+  fi
+
+  shift
+  set -- "$HOST_CMD_PATH" "$@"
+
+  # Also expose the command's directory in PATH, because some tools call
+  # sibling executables relative to PATH.
+  CMD_DIR="$(dirname -- "$HOST_CMD_PATH")"
+  BWRAP_ARGS+=(--setenv PATH "$CMD_DIR:$SANDBOX_PATH")
+fi
+
+bwrap "${BWRAP_ARGS[@]}" -- "$@"
