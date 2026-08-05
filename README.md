@@ -2,7 +2,24 @@
 
 `bw` is a small Bash wrapper around [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) that runs coding-agent CLIs — such as **opencode**, **omp**, **codex**, **claude**, and **junie** — inside an unprivileged Linux sandbox.
 
-It is **fail-closed**: the sandbox default-denies access to all host data and exposes only an explicit allowlist of paths. Secrets are hidden, the environment is stripped to a small predictable set, and network access is controllable per run.
+It is **fail-closed**: the sandbox default-denies access to all host data and exposes only an explicit allowlist of paths. Secrets are hidden, the environment is stripped to a small predictable set, and network access is controllable per run. It is also deliberately **opinionated**: see [Opinionated by design](#opinionated-by-design).
+
+## Opinionated by design
+
+**`bw` is very opinionated.** It is not a general-purpose sandbox launcher — it encodes one specific Linux workstation and one specific set of coding agents. It has no config file, no environment-variable overrides, and no auto-detection: the configuration *is* the arrays at the top of `scripts/bw`. Expect to fork it and edit those arrays before it runs at all on your machine.
+
+Baked-in assumptions, each of which aborts the run (exit `2`) when unmet:
+
+- **A mise-managed Node is mandatory** at exactly `~/.local/share/mise/installs/node/latest/bin/node` — even for agents that do not need Node. It is unconditionally prepended to the sandbox `PATH`.
+- **A pyenv/pipx/mise/Poetry toolchain is assumed present**: `~/.pyenv`, `~/.local/bin`, `~/.local/share/mise`, `~/.local/share/pipx`, `~/.config/mise`, and `~/.config/pypoetry/config.toml` are all mounted read-only and must exist. Poetry's `auth.toml` is deliberately *not* mounted — private package credentials stay outside `bw`.
+- **The writable allowlist is one author's agent set** — `~/.claude`, `~/.claude.json`, `~/.codex`, `~/.junie`, `~/.local/bin/junie`, and the opencode directories (`~/.config/opencode`, `~/.cache/opencode`, `~/.local/share/opencode`, `~/.local/state/opencode`, `~/.opencode`) — and every entry must already exist.
+- **KDE is assumed** as the desktop editor: `~/.local/share/kwrite` and `~/.config/kwriterc` are in the writable allowlist.
+- **Wayland only.** The Wayland socket is the single host runtime socket exposed (for clipboard support); no `DISPLAY` / X11 socket is ever forwarded.
+- **The sandbox home path is fixed** at `~/sandbox_home`; there is no flag to relocate or disable it.
+- **Fixed env allowlists.** Terminal hints and LLM API keys are forwarded from a hardcoded list of variable names; anything not on those lists is dropped by `--clearenv`.
+- **Two hardcoded launchers.** `bwoc` and `bwomp` exist only for `opencode` and `omp`; other agents are run as `bw <command>`.
+
+Adapting it means editing `scripts/bw` — see [Configuration](#configuration).
 
 ## Why
 
@@ -23,7 +40,7 @@ Everything else in your home directory is invisible. Project `.env` files are hi
   - `~/.pyenv`, `~/.local/bin`, `~/.local/share/mise`, `~/.local/share/pipx`, `~/.config/mise`
   - `~/.config/pypoetry/config.toml`
 
-Agent config/state directories in the writable allowlist (e.g. `~/.claude`, `~/.codex`, `~/.config/opencode`) must already exist; the script aborts if a listed path is missing. Edit the allowlist arrays at the top of `scripts/bw` to match your setup.
+Agent config/state directories and files in the writable allowlist (e.g. `~/.claude`, `~/.codex`, `~/.config/opencode`, `~/.config/kwriterc`) must already exist; the script aborts if a listed entry is missing. This list is not a suggestion — it is the author's setup. Edit the allowlist arrays at the top of `scripts/bw` to match your machine before the first run.
 
 ## Install
 
@@ -93,7 +110,7 @@ Layering: `bwoc` / `bwomp` → `bw` → `bwrap`.
 
 ## Configuration
 
-The exposed paths are declared as arrays at the top of `scripts/bw`. Edit these to fit your machine; every listed entry is asserted to exist at runtime:
+There is no config file and no override mechanism: **`scripts/bw` is the configuration.** The exposed paths are declared as arrays at the top of the script; edit them to fit your machine. Every listed entry is asserted to exist at runtime, so a stale entry fails the run rather than being skipped:
 
 - `SYSTEM_RO_PATHS` — read-only system mounts.
 - `READONLY_HOME_PATHS`, `READONLY_HOME_FILES` — read-only tool dirs/files under `$HOME`.
