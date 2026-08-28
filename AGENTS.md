@@ -11,14 +11,14 @@ Layering: `bwoc`/`bwomp` → `bw` → `bwrap`.
 `scripts/bw` is a linear, fail-closed pipeline (`scripts/bw:1` sets `set -euo pipefail`):
 
 1. **Parse options** — `--workdir`, `--mask`, `--offline`, `--allow-env-file`, `--docker`, `--help`; the rest is `command [args...]`.
-2. **Validate** — canonicalize every path; refuse `workdir == HOME` or `workdir` inside `sandbox_home`; reject masks that would hide the workdir/sandbox home; require every read-only/writable HOME path and file to exist. With `--docker`, reject `--offline`, resolve Docker CLI endpoint precedence, and accept only an existing local Unix socket. A default `.env.sandbox` must be a regular non-symlink file.
+2. **Validate** — canonicalize every path; refuse `workdir == HOME` or `workdir` inside `sandbox_home`; reject masks that would hide the workdir/sandbox home; require every read-only/writable HOME path and file to exist. With `--docker`, reject `--offline`, resolve Docker CLI endpoint precedence, and accept only an existing local Unix socket. A default `.env.sandbox` and its `.env` destination must both be regular non-symlink files.
 3. **Assemble `bwrap` args** — per-user state dir for the deny mount sources; private `/proc`, `/dev`, tmpfs `/tmp`; `--clearenv`; read-only system + tool mounts; writable allowlist + workdir; masks; `.env` hiding or `.env.sandbox` mapping; optional Wayland and Docker sockets; network toggle.
 4. **Resolve command** — process name symlink; alias vs. host binary vs. path; augment `PATH`.
 5. **Exec** `exec -a "$BW_ARGV0" "${BW_EXEC[@]}" "${BWRAP_ARGS[@]}" -- "$@"`.
 
 **Security model:** `SANDBOX_HOME` (`$HOME/sandbox_home`, mode `0700`) is bind-mounted over `$HOME` as a persistent fallback; specific HOME mounts overlay it. `--unshare-all` drops all namespaces; `--share-net` opts networking back in only when not `--offline`. Masks and hidden environment files overlay an empty read-only dir/file (`EMPTY_DENY_DIR`/`EMPTY_DENY_FILE`). Those two objects plus the process-name symlinks live in a per-user state dir (`$XDG_RUNTIME_DIR/bw`, falling back to `${TMPDIR:-/tmp}/bw-$UID`), guarded by symlink/ownership/emptiness checks and never mounted into the sandbox; there is no cleanup trap because `bw` `exec`s `bwrap`.
 
-By default, a regular `.env.sandbox` at the workdir root is mounted read-only as `.env`; its original name and all other regular `.env` files remain hidden. A `.env.sandbox` symlink or non-regular file is rejected. `--allow-env-file` instead exposes the real `.env` files. `--docker` is a separate opt-in: it bind-mounts only the resolved local Docker Unix socket at `/tmp/runtime/docker.sock`, sets a fixed internal `DOCKER_HOST`, rejects `--offline`, and never exposes `~/.docker`.
+By default, a regular `.env.sandbox` at the workdir root is mounted read-only over an existing regular `.env`; its original name and all other regular `.env` files remain hidden. Missing destinations, symlinks, and non-regular files are rejected to prevent bind setup from mutating the host project. `--allow-env-file` instead exposes the real `.env` files. `--docker` is a separate opt-in: it bind-mounts only the resolved local Docker Unix socket at `/tmp/runtime/docker.sock`, sets a fixed internal `DOCKER_HOST`, rejects `--offline`, and never exposes `~/.docker`.
 
 **Process naming:** `bw` `exec`s `bwrap` through a symlink named after the requested program (`$BW_NAME_DIR/<name>` → the real `bwrap`) with `exec -a "<name>"`, so the pty's foreground process-group leader has both `comm` and `argv[0]` set to e.g. `opencode`. tmux window names (`#{pane_current_command}`) and Konsole tab titles (`%n`) therefore show the sandboxed program instead of `bash`; `ps` shows it too. Symlink creation failures fall back to the plain binary — naming never blocks a run.
 
@@ -78,7 +78,7 @@ Recommended (not present) checks for changes: `shellcheck scripts/bw` and `shfmt
 No test suite, CI, or linters exist. Verify changes by **running** the script against real invocations:
 
 - Smoke test: `scripts/bw --help`, then `scripts/bw --offline bash` and inspect the sandbox (`mount`, `env`, `ls "$HOME"`, network reachability).
-- For `.env.sandbox`, confirm that it appears read-only as `.env`, its source name stays hidden, unrelated `.env.*` files stay hidden, and symlinks fail closed.
+- For `.env.sandbox`, confirm that it appears read-only as `.env`, its source name stays hidden, unrelated `.env.*` files stay hidden, and symlinks or missing destinations fail closed without creating host files.
 - For `--docker`, confirm the default sandbox has no Docker socket, invalid/offline endpoints fail before `bwrap`, and both `docker ps` and a temporary Unix echo socket work through the mounted path.
 - When adding an allowlist entry or mask, confirm the path is visible/hidden inside the sandbox and that validation still rejects conflicting configs.
 - Before committing, run `shellcheck` and `shfmt` locally even though they are not wired into the repo.

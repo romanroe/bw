@@ -238,6 +238,12 @@ if [[ "$ALLOW_ENV_FILE" -eq 0 ]]; then
   elif [[ -e "$SANDBOX_ENV_FILE" && ! -f "$SANDBOX_ENV_FILE" ]]; then
     echo "Sandbox env file is not a regular file: $SANDBOX_ENV_FILE" >&2
     exit 2
+  elif [[ -f "$SANDBOX_ENV_FILE" ]]; then
+    ENV_FILE="$WORKDIR/.env"
+    if [[ -L "$ENV_FILE" || ! -f "$ENV_FILE" ]]; then
+      echo "Sandbox env mapping requires an existing regular non-symlink file: $ENV_FILE" >&2
+      exit 2
+    fi
   fi
 fi
 
