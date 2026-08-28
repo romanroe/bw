@@ -11,7 +11,8 @@ Options:
   --workdir DIR      Directory that should be mounted read-write. Default: current directory.
   --mask PATH        Hide this host path inside the sandbox. Can be used multiple times.
   --offline          Disable network access.
-  --allow-env-file   Expose .env / .env.* files in the workdir. Default: hidden.
+  --allow-env-file   Expose real .env / .env.* files instead of using .env.sandbox.
+  --docker           Expose the local Docker daemon. Breaks sandbox isolation.
   --help             Show this help.
 
 Examples:
@@ -19,6 +20,7 @@ Examples:
   bw --offline bash
   bw --mask "$HOME/Nextcloud/Privat" -- opencode
   bw --allow-env-file -- opencode
+  bw --docker -- omp
 USAGE
 }
 
@@ -49,10 +51,25 @@ is_subpath_or_same() {
   [[ "$child" == "$parent" || "$child" == "$parent"/* ]]
 }
 
+# Create a directory with an exact mode, tolerating a concurrent bw run that
+# created it first. No -p: every parent here is required to exist already, and
+# -p would create parents with the umask mode instead of "$mode".
+ensure_dir() {
+  local dir="$1"
+  local mode="$2"
+
+  [[ -d "$dir" ]] && return 0
+  mkdir -m "$mode" -- "$dir" 2>/dev/null || [[ -d "$dir" ]]
+}
+
 require_cmd bwrap
 require_cmd readlink
-require_cmd mktemp
 require_cmd mkdir
+require_cmd ln
+
+# The symlink used to name the process must point at the executable itself,
+# not at whatever bwrap resolves to on PATH later.
+BWRAP_BIN="$(readlink -f -- "$(command -v bwrap)")"
 
 REAL_HOME="${HOME:?HOME is not set}"
 REAL_USER="${USER:-$(id -un)}"
@@ -62,6 +79,7 @@ WORKDIR="$(pwd -P)"
 SANDBOX_HOME="$REAL_HOME/sandbox_home"
 NETWORK=1
 ALLOW_ENV_FILE=0
+DOCKER_ACCESS=0
 
 # These directories provide the runtime dependencies for host executables
 # without exposing user data outside the explicit allowlist below.
@@ -86,6 +104,8 @@ READONLY_HOME_PATHS=(
   "$REAL_HOME/.local/share/mise"
   "$REAL_HOME/.local/share/pipx"
   "$REAL_HOME/.config/mise"
+  "$REAL_HOME/.cargo/bin"
+  "$REAL_HOME/.rustup"
 )
 
 # Host files under HOME required at runtime but kept read-only. Do not add
@@ -109,6 +129,7 @@ WRITABLE_HOME_PATHS=(
   "$REAL_HOME/.local/share/opencode"
   "$REAL_HOME/.local/state/opencode"
   "$REAL_HOME/.opencode"
+  "$REAL_HOME/.omp"
 )
 
 # Host files under HOME that should be writable inside the sandbox.
@@ -135,6 +156,10 @@ while [[ $# -gt 0 ]]; do
       NETWORK=0
       shift
       ;;
+    --docker)
+      DOCKER_ACCESS=1
+      shift
+      ;;
     --allow-env-file)
       ALLOW_ENV_FILE=1
       shift
@@ -154,6 +179,45 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ $# -gt 0 ]] || { usage >&2; exit 2; }
+
+DOCKER_SOCKET=""
+if [[ "$DOCKER_ACCESS" -eq 1 ]]; then
+  if [[ "$NETWORK" -eq 0 ]]; then
+    echo "Refusing to run: --docker cannot be combined with --offline." >&2
+    echo "Docker daemon access can bypass network isolation." >&2
+    exit 2
+  fi
+
+  require_cmd docker
+  DOCKER_ENDPOINT=""
+  if [[ -n "${DOCKER_HOST:-}" ]]; then
+    DOCKER_ENDPOINT="$DOCKER_HOST"
+  elif [[ -n "${DOCKER_CONTEXT:-}" ]]; then
+    if ! DOCKER_ENDPOINT="$(docker context inspect "$DOCKER_CONTEXT" --format '{{ (index .Endpoints "docker").Host }}' 2>/dev/null)"; then
+      echo "Unable to resolve Docker endpoint for --docker." >&2
+      exit 2
+    fi
+  elif ! DOCKER_ENDPOINT="$(docker context inspect --format '{{ (index .Endpoints "docker").Host }}' 2>/dev/null)"; then
+    echo "Unable to resolve Docker endpoint for --docker." >&2
+    exit 2
+  fi
+
+  if [[ -z "$DOCKER_ENDPOINT" ]]; then
+    echo "Unable to resolve Docker endpoint for --docker." >&2
+    exit 2
+  fi
+  if [[ "$DOCKER_ENDPOINT" != unix:///* ]]; then
+    echo "Refusing to run: --docker requires a local Unix socket." >&2
+    echo "  endpoint: $DOCKER_ENDPOINT" >&2
+    exit 2
+  fi
+
+  DOCKER_SOCKET="$(canon_path "${DOCKER_ENDPOINT#unix://}")"
+  if [[ ! -S "$DOCKER_SOCKET" ]]; then
+    echo "Docker endpoint does not exist or is not a Unix socket: $DOCKER_SOCKET" >&2
+    exit 2
+  fi
+fi
 [[ -d "$WORKDIR" ]] || {
   echo "Workdir does not exist or is not a directory: $WORKDIR" >&2
   exit 2
@@ -164,6 +228,17 @@ REAL_HOME="$(canon_path "$REAL_HOME")"
 SANDBOX_HOME="$(canon_path "$SANDBOX_HOME")"
 if [[ -n "$REAL_XDG_RUNTIME_DIR" ]]; then
   REAL_XDG_RUNTIME_DIR="$(canon_path "$REAL_XDG_RUNTIME_DIR")"
+fi
+
+SANDBOX_ENV_FILE="$WORKDIR/.env.sandbox"
+if [[ "$ALLOW_ENV_FILE" -eq 0 ]]; then
+  if [[ -L "$SANDBOX_ENV_FILE" ]]; then
+    echo "Sandbox env file must not be a symlink: $SANDBOX_ENV_FILE" >&2
+    exit 2
+  elif [[ -e "$SANDBOX_ENV_FILE" && ! -f "$SANDBOX_ENV_FILE" ]]; then
+    echo "Sandbox env file is not a regular file: $SANDBOX_ENV_FILE" >&2
+    exit 2
+  fi
 fi
 
 if [[ "$WORKDIR" == "$REAL_HOME" ]]; then
@@ -251,12 +326,13 @@ for raw in "${READONLY_HOME_PATHS[@]}"; do
 done
 
 NODE_BIN="$(canon_path "$REAL_HOME/.local/share/mise/installs/node/latest/bin")"
+CARGO_BIN="$(canon_path "$REAL_HOME/.cargo/bin")"
 if [[ ! -x "$NODE_BIN/node" ]]; then
   echo "Codex Node runtime is not executable: $NODE_BIN/node" >&2
   exit 2
 fi
 
-SANDBOX_PATH="$NODE_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+SANDBOX_PATH="$CARGO_BIN:$NODE_BIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 IFS=: read -r -a HOST_PATH_ENTRIES <<< "$PATH"
 for raw_path in "${HOST_PATH_ENTRIES[@]}"; do
   [[ -n "$raw_path" ]] || continue
@@ -353,11 +429,63 @@ for raw in "${WRITABLE_HOME_FILES[@]}"; do
   done
 done
 
-EMPTY_DENY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bwrap-deny.XXXXXX")"
-chmod 0555 "$EMPTY_DENY_DIR"
-EMPTY_DENY_FILE="$(mktemp "${TMPDIR:-/tmp}/bwrap-deny-file.XXXXXX")"
-chmod 0444 "$EMPTY_DENY_FILE"
-trap 'rm -rf "$EMPTY_DENY_DIR" "$EMPTY_DENY_FILE"' EXIT
+# Mount sources for masked paths and hidden .env files, plus the argv0/comm
+# symlinks used to name the process after the sandboxed program. Kept in a
+# per-user state directory instead of per-run temp files, because bw exec()s
+# bwrap and no EXIT trap can clean up afterwards. This directory is never
+# mounted into the sandbox.
+if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "$XDG_RUNTIME_DIR" && -O "$XDG_RUNTIME_DIR" ]]; then
+  BW_STATE_DIR="$XDG_RUNTIME_DIR/bw"
+else
+  BW_STATE_DIR="${TMPDIR:-/tmp}/bw-$UID"
+fi
+
+if [[ -L "$BW_STATE_DIR" ]]; then
+  echo "Refusing to run: bw state directory is a symlink: $BW_STATE_DIR" >&2
+  exit 2
+fi
+if ! ensure_dir "$BW_STATE_DIR" 0700; then
+  echo "Refusing to run: cannot create bw state directory: $BW_STATE_DIR" >&2
+  exit 2
+fi
+if [[ ! -O "$BW_STATE_DIR" ]]; then
+  echo "Refusing to run: bw state directory is not owned by this user: $BW_STATE_DIR" >&2
+  exit 2
+fi
+
+EMPTY_DENY_DIR="$BW_STATE_DIR/deny-dir"
+EMPTY_DENY_FILE="$BW_STATE_DIR/deny-file"
+BW_NAME_DIR="$BW_STATE_DIR/names"
+
+if [[ -L "$EMPTY_DENY_DIR" || -L "$EMPTY_DENY_FILE" ]]; then
+  echo "Refusing to run: deny mount source is a symlink." >&2
+  echo "  dir:  $EMPTY_DENY_DIR" >&2
+  echo "  file: $EMPTY_DENY_FILE" >&2
+  exit 2
+fi
+
+if ! ensure_dir "$EMPTY_DENY_DIR" 0555; then
+  echo "Refusing to run: cannot create deny directory: $EMPTY_DENY_DIR" >&2
+  exit 2
+fi
+[[ -e "$EMPTY_DENY_FILE" ]] || (umask 0333 && : >"$EMPTY_DENY_FILE")
+
+# Naming the process is cosmetic, so a missing name directory must never abort
+# a run; the exec below falls back to the plain bwrap binary.
+ensure_dir "$BW_NAME_DIR" 0700 || true
+
+# A polluted deny source would leak its contents into every masked path.
+shopt -s nullglob dotglob
+deny_dir_entries=("$EMPTY_DENY_DIR"/*)
+shopt -u nullglob dotglob
+if [[ ! -d "$EMPTY_DENY_DIR" || ${#deny_dir_entries[@]} -ne 0 ]]; then
+  echo "Refusing to run: deny directory is not an empty directory: $EMPTY_DENY_DIR" >&2
+  exit 2
+fi
+if [[ ! -f "$EMPTY_DENY_FILE" || -s "$EMPTY_DENY_FILE" ]]; then
+  echo "Refusing to run: deny file is not an empty regular file: $EMPTY_DENY_FILE" >&2
+  exit 2
+fi
 
 BWRAP_ARGS=(
   --die-with-parent
@@ -410,11 +538,15 @@ for raw in "${READONLY_HOME_FILES[@]}"; do
   BWRAP_ARGS+=(--ro-bind "$path" "$path")
 done
 
-# Use a private runtime directory. The Wayland socket is the only host runtime
-# socket deliberately exposed, which keeps Wayland clipboard support working.
+# Use a private runtime directory. Only explicitly enabled host sockets are
+# exposed within it.
 BWRAP_ARGS+=(--dir /tmp/runtime)
 BWRAP_ARGS+=(--chmod 0700 /tmp/runtime)
 BWRAP_ARGS+=(--setenv XDG_RUNTIME_DIR /tmp/runtime)
+if [[ "$DOCKER_ACCESS" -eq 1 ]]; then
+  BWRAP_ARGS+=(--bind "$DOCKER_SOCKET" /tmp/runtime/docker.sock)
+  BWRAP_ARGS+=(--setenv DOCKER_HOST unix:///tmp/runtime/docker.sock)
+fi
 if [[ -n "$WAYLAND_SOCKET" ]]; then
   BWRAP_ARGS+=(--bind "$WAYLAND_SOCKET" "/tmp/runtime/$REAL_WAYLAND_DISPLAY")
   BWRAP_ARGS+=(--setenv WAYLAND_DISPLAY "$REAL_WAYLAND_DISPLAY")
@@ -499,22 +631,47 @@ for raw in "${MASKED_PATHS[@]}"; do
   fi
 done
 
-# Hide project secret files by default. Each matching .env file in the workdir
-# is replaced by an empty, read-only file. --allow-env-file opts out and exposes
-# the real contents. Symlinks (-type f excludes them) and the well-known
-# non-secret templates are left untouched.
+# Hide project secret files by default. A regular .env.sandbox at the workdir
+# root is exposed read-only as .env, while its original name and all other
+# matching regular files remain hidden. --allow-env-file opts out and exposes
+# the real files. Other symlinks and the well-known non-secret templates are
+# left untouched.
 if [[ "$ALLOW_ENV_FILE" -eq 0 ]]; then
   while IFS= read -r -d '' env_file; do
     case "${env_file##*/}" in
       .env.example|.env.sample|.env.template|.env.dist) continue ;;
     esac
+    [[ "$env_file" == "$SANDBOX_ENV_FILE" ]] && continue
     BWRAP_ARGS+=(--ro-bind "$EMPTY_DENY_FILE" "$env_file")
   done < <(find "$WORKDIR" -type f \( -name '.env' -o -name '.env.*' \) -print0)
+
+  if [[ -f "$SANDBOX_ENV_FILE" ]]; then
+    BWRAP_ARGS+=(--ro-bind "$SANDBOX_ENV_FILE" "$WORKDIR/.env")
+    BWRAP_ARGS+=(--ro-bind "$EMPTY_DENY_FILE" "$SANDBOX_ENV_FILE")
+  fi
 fi
 
 BWRAP_ARGS+=(--chdir "$WORKDIR")
 
 CMD="$1"
+
+# tmux names a window after argv[0] of the pty's foreground process group
+# leader; Konsole uses that process's comm. exec()ing bwrap keeps this PID as
+# the group leader, and the kernel takes comm from the basename of the exec'd
+# path (symlinks are not resolved), so a symlink named after the program plus
+# exec -a sets both. Result: the tab shows "opencode" instead of "bash".
+BW_EXEC=("$BWRAP_BIN")
+BW_ARGV0="$BWRAP_BIN"
+
+bw_name="$(basename -- "$CMD")"
+case "$bw_name" in
+  ''|.|..) bw_name="" ;;
+esac
+
+if [[ -n "$bw_name" ]] && ln -sfn -- "$BWRAP_BIN" "$BW_NAME_DIR/$bw_name" 2>/dev/null; then
+  BW_EXEC=("$BW_NAME_DIR/$bw_name")
+  BW_ARGV0="$bw_name"
+fi
 
 if [[ "$CMD" != */* ]]; then
   SHELL_CMD_TYPE=""
@@ -523,8 +680,7 @@ if [[ "$CMD" != */* ]]; then
      && [[ "${SHELL_CMD_TYPE##*$'\n'}" == "alias" ]]; then
     shift
     set -- /bin/bash -ic "$CMD \"\$@\"" bash "$@"
-    bwrap "${BWRAP_ARGS[@]}" -- "$@"
-    exit $?
+    exec -a "$BW_ARGV0" "${BW_EXEC[@]}" "${BWRAP_ARGS[@]}" -- "$@"
   fi
 
   HOST_CMD_PATH="$(command -v -- "$CMD" || true)"
@@ -549,4 +705,4 @@ if [[ "$CMD" != */* ]]; then
   BWRAP_ARGS+=(--setenv PATH "$CMD_DIR:$SANDBOX_PATH")
 fi
 
-bwrap "${BWRAP_ARGS[@]}" -- "$@"
+exec -a "$BW_ARGV0" "${BW_EXEC[@]}" "${BWRAP_ARGS[@]}" -- "$@"
